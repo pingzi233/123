@@ -45,11 +45,10 @@ import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.contract.ActivityResultContracts.CreateDocument
+import androidx.activity.viewModels
+import androidx.annotation.ChecksSdkIntAtLeast
+import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AlertDialog
-import androidx.compose.material3.LocalContentColor
-import androidx.compose.material3.LocalTextStyle
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -61,6 +60,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.isVisible
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.shape.MaterialShapeDrawable
 import com.hippo.ehviewer.BuildConfig
@@ -80,7 +80,12 @@ import com.hippo.ehviewer.util.ExceptionUtils
 import com.hippo.ehviewer.util.FileUtils
 import com.hippo.ehviewer.util.getParcelableCompat
 import com.hippo.ehviewer.util.getParcelableExtraCompat
+import com.hippo.ehviewer.util.getValue
+import com.hippo.ehviewer.util.isAtLeastO
+import com.hippo.ehviewer.util.isAtLeastP
+import com.hippo.ehviewer.util.lazyMut
 import com.hippo.ehviewer.util.sendTo
+import com.hippo.ehviewer.util.setValue
 import com.hippo.unifile.UniFile
 import dev.chrisbanes.insetter.applyInsetter
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
@@ -93,15 +98,21 @@ import eu.kanade.tachiyomi.ui.reader.viewer.pager.R2LPagerViewer
 import eu.kanade.tachiyomi.util.lang.launchIO
 import eu.kanade.tachiyomi.util.lang.withUIContext
 import eu.kanade.tachiyomi.util.system.applySystemAnimatorScale
-import eu.kanade.tachiyomi.util.system.hasDisplayCutout
 import eu.kanade.tachiyomi.util.system.isNightMode
 import eu.kanade.tachiyomi.util.view.copy
 import eu.kanade.tachiyomi.util.view.popupMenu
 import eu.kanade.tachiyomi.util.view.setTooltip
 import eu.kanade.tachiyomi.widget.listener.SimpleAnimationListener
+import java.io.File
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.resume
+import kotlin.math.abs
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.merge
@@ -109,12 +120,15 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.sample
 import kotlinx.coroutines.suspendCancellableCoroutine
 import splitties.systemservices.clipboardManager
-import java.io.File
-import java.io.IOException
-import java.util.concurrent.atomic.AtomicReference
-import kotlin.coroutines.Continuation
-import kotlin.coroutines.resume
-import kotlin.math.abs
+
+class GalleryModel : ViewModel() {
+    var galleryProvider: PageLoader2? = null
+    override fun onCleared() {
+        super.onCleared()
+        galleryProvider?.stop()
+        galleryProvider = null
+    }
+}
 
 class ReaderActivity : EhActivity() {
     lateinit var binding: ReaderActivityBinding
@@ -124,6 +138,7 @@ class ReaderActivity : EhActivity() {
     private var mGalleryInfo: BaseGalleryInfo? = null
     private var mPage: Int = 0
     private var mCacheFileName: String? = null
+    private val vm: GalleryModel by viewModels()
 
     /**
      * Whether the menu is currently visible.
@@ -159,7 +174,7 @@ class ReaderActivity : EhActivity() {
             }
         }
     }
-    var mGalleryProvider: PageLoader2? = null
+    var mGalleryProvider by lazyMut { vm::galleryProvider }
     private var mCurrentIndex: Int = 0
     private var mSavingPage = -1
     private lateinit var builder: EditTextDialogBuilder
@@ -197,54 +212,58 @@ class ReaderActivity : EhActivity() {
         if (ACTION_EH == mAction) {
             mGalleryInfo?.let { mGalleryProvider = EhPageLoader(it) }
         } else if (Intent.ACTION_VIEW == mAction) {
-            if (mUri != null) {
-                try {
-                    grantUriPermission(
-                        BuildConfig.APPLICATION_ID,
-                        mUri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                    )
-                } catch (e: Exception) {
-                    Toast.makeText(this, R.string.error_reading_failed, Toast.LENGTH_SHORT).show()
-                }
+            if (isAtLeastP) {
+                if (mUri != null) {
+                    try {
+                        grantUriPermission(
+                            BuildConfig.APPLICATION_ID,
+                            mUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                        )
+                    } catch (e: Exception) {
+                        Toast.makeText(this, R.string.error_reading_failed, Toast.LENGTH_SHORT).show()
+                    }
 
-                val continuation: AtomicReference<Continuation<String>?> = AtomicReference(null)
-                mGalleryProvider = ArchivePageLoader(
-                    this,
-                    mUri!!,
-                    flow {
-                        if (!dialogShown) {
-                            withUIContext {
-                                dialogShown = true
-                                dialog.run {
-                                    show()
-                                    getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                                        val passwd = builder.text
-                                        if (passwd.isEmpty()) {
-                                            builder.setError(getString(R.string.passwd_cannot_be_empty))
-                                        } else {
-                                            continuation.getAndSet(null)?.resume(passwd)
+                    val continuation: AtomicReference<Continuation<String>?> = AtomicReference(null)
+                    mGalleryProvider = ArchivePageLoader(
+                        this,
+                        mUri!!,
+                        flow {
+                            if (!dialogShown) {
+                                withUIContext {
+                                    dialogShown = true
+                                    dialog.run {
+                                        show()
+                                        getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                                            val passwd = builder.text
+                                            if (passwd.isEmpty()) {
+                                                builder.setError(getString(R.string.passwd_cannot_be_empty))
+                                            } else {
+                                                continuation.getAndSet(null)?.resume(passwd)
+                                            }
                                         }
-                                    }
-                                    setOnCancelListener {
-                                        finish()
+                                        setOnCancelListener {
+                                            finish()
+                                        }
                                     }
                                 }
                             }
-                        }
-                        while (true) {
-                            currentCoroutineContext().ensureActive()
-                            val r = suspendCancellableCoroutine {
-                                continuation.set(it)
-                                it.invokeOnCancellation { dialog.dismiss() }
+                            while (true) {
+                                currentCoroutineContext().ensureActive()
+                                val r = suspendCancellableCoroutine {
+                                    continuation.set(it)
+                                    it.invokeOnCancellation { dialog.dismiss() }
+                                }
+                                emit(r)
+                                withUIContext {
+                                    builder.setError(getString(R.string.passwd_wrong))
+                                }
                             }
-                            emit(r)
-                            withUIContext {
-                                builder.setError(getString(R.string.passwd_wrong))
-                            }
-                        }
-                    },
-                )
+                        },
+                    )
+                }
+            } else {
+                Toast.makeText(this, "Archives are not supported before Android P", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -260,7 +279,6 @@ class ReaderActivity : EhActivity() {
 
     private fun onInit() {
         handleIntent(intent)
-        buildProvider()
     }
 
     private fun onRestore(savedInstanceState: Bundle) {
@@ -270,7 +288,6 @@ class ReaderActivity : EhActivity() {
         mGalleryInfo = savedInstanceState.getParcelableCompat(KEY_GALLERY_INFO)
         mPage = savedInstanceState.getInt(KEY_PAGE, -1)
         mCurrentIndex = savedInstanceState.getInt(KEY_CURRENT_INDEX)
-        buildProvider()
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -282,6 +299,7 @@ class ReaderActivity : EhActivity() {
                 it.start()
                 if (it.awaitReady()) {
                     withUIContext {
+                        totalPage = it.size
                         viewer?.setGalleryProvider(it)
                         moveToPageIndex(0)
                     }
@@ -304,18 +322,19 @@ class ReaderActivity : EhActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.colorMode = if (Image.isWideColorGamut && ReaderPreferences.wideColorGamut()
-                .get()
-        ) {
-            ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
-        } else {
-            ActivityInfo.COLOR_MODE_DEFAULT
+        if (isAtLeastO) {
+            window.colorMode = if (Image.isWideColorGamut && ReaderPreferences.wideColorGamut().get()) {
+                ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
+            } else {
+                ActivityInfo.COLOR_MODE_DEFAULT
+            }
         }
         if (savedInstanceState == null) {
             onInit()
         } else {
             onRestore(savedInstanceState)
         }
+        buildProvider()
         binding = ReaderActivityBinding.inflate(layoutInflater)
         setContentView(binding.root)
         builder = EditTextDialogBuilder(this, null, getString(R.string.archive_passwd))
@@ -367,10 +386,8 @@ class ReaderActivity : EhActivity() {
         config = null
         viewer?.destroy()
         viewer = null
-        if (mGalleryProvider != null) {
-            mGalleryProvider!!.stop()
-            mGalleryProvider = null
-        }
+        readerSettingSheetDialog?.dismiss()
+        readerSettingSheetDialog = null
     }
 
     fun shareImage(page: Int) {
@@ -604,7 +621,9 @@ class ReaderActivity : EhActivity() {
     var viewer: BaseViewer? = null
         private set
 
-    val hasCutout by lazy { hasDisplayCutout() }
+    // We don't know if the device has cutout since the insets are not applied yet
+    @get:ChecksSdkIntAtLeast(Build.VERSION_CODES.P)
+    val hasCutout = isAtLeastP
 
     private var config: ReaderConfig? = null
 
@@ -614,6 +633,8 @@ class ReaderActivity : EhActivity() {
             binding.root,
         )
     }
+
+    private var readerSettingSheetDialog: ReaderSettingsSheet? = null
 
     /**
      * Sets the visibility of the menu according to [visible] and with an optional parameter to
@@ -675,18 +696,6 @@ class ReaderActivity : EhActivity() {
             }
         }
 
-        binding.pageNumber.setMD3Content {
-            CompositionLocalProvider(
-                LocalTextStyle provides MaterialTheme.typography.bodySmall,
-                LocalContentColor provides MaterialTheme.colorScheme.onBackground,
-            ) {
-                PageIndicatorText(
-                    currentPage = currentPage,
-                    totalPages = totalPage,
-                )
-            }
-        }
-
         // Init listeners on bottom menu
         binding.readerNav.setMD3Content {
             ChapterNavigator(
@@ -727,7 +736,7 @@ class ReaderActivity : EhActivity() {
 
             setOnClickListener {
                 popupMenu(
-                    items = ReadingModeType.values().map { it.flagValue to it.stringRes },
+                    items = ReadingModeType.entries.map { it.flagValue to it.stringRes },
                     selectedItemId = ReaderPreferences.defaultReadingMode().get(),
                 ) {
                     val newReadingMode = ReadingModeType.fromPreference(itemId)
@@ -742,7 +751,7 @@ class ReaderActivity : EhActivity() {
 
             setOnClickListener {
                 popupMenu(
-                    items = OrientationType.values().map { it.flagValue to it.stringRes },
+                    items = OrientationType.entries.map { it.flagValue to it.stringRes },
                     selectedItemId = ReaderPreferences.defaultOrientationType().get(),
                 ) {
                     val newOrientation = OrientationType.fromPreference(itemId)
@@ -754,10 +763,10 @@ class ReaderActivity : EhActivity() {
         // Settings sheet
         with(binding.actionSettings) {
             setTooltip(R.string.action_settings)
-            val readerSettingSheetDialog = ReaderSettingsSheet(this@ReaderActivity)
+            readerSettingSheetDialog = ReaderSettingsSheet(this@ReaderActivity)
             setOnClickListener {
-                if (!readerSettingSheetDialog.isShowing) {
-                    readerSettingSheetDialog.show()
+                if (!readerSettingSheetDialog!!.isShowing) {
+                    readerSettingSheetDialog!!.show()
                 }
             }
 
@@ -808,6 +817,7 @@ class ReaderActivity : EhActivity() {
     fun onPageSelected(page: ReaderPage) {
         // Set bottom page number
         currentPage = page.number
+        binding.pageNumber.text = "$currentPage/$totalPage"
 
         mCurrentIndex = page.index
         mGalleryProvider?.putStartPage(mCurrentIndex)
@@ -905,10 +915,12 @@ class ReaderActivity : EhActivity() {
          */
         init {
             ReaderPreferences.defaultReadingMode().changes()
+                .drop(1)
                 .onEach { setGallery() }
                 .launchIn(lifecycleScope)
 
             ReaderPreferences.defaultOrientationType().changes()
+                .drop(1)
                 .onEach { setGallery() }
                 .launchIn(lifecycleScope)
 
@@ -937,9 +949,17 @@ class ReaderActivity : EhActivity() {
                 .onEach { setTrueColor(it) }
                 .launchIn(lifecycleScope)
 
-            ReaderPreferences.cutoutShort().changes()
-                .onEach { setCutoutShort(it) }
-                .launchIn(lifecycleScope)
+            if (hasCutout) {
+                setCutoutShort(ReaderPreferences.cutoutShort().get())
+                ReaderPreferences.cutoutShort().changes()
+                    .drop(1)
+                    .onEach {
+                        readerSettingSheetDialog?.hide()
+                        setCutoutShort(it)
+                        recreate()
+                    }
+                    .launchIn(lifecycleScope)
+            }
 
             ReaderPreferences.keepScreenOn().changes()
                 .onEach { setKeepScreenOn(it) }
@@ -1006,14 +1026,12 @@ class ReaderActivity : EhActivity() {
             // TODO()
         }
 
+        @RequiresApi(Build.VERSION_CODES.P)
         private fun setCutoutShort(enabled: Boolean) {
             window.attributes.layoutInDisplayCutoutMode = when (enabled) {
                 true -> WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
                 false -> WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_NEVER
             }
-
-            // Trigger relayout
-            setMenuVisibility(menuVisible)
         }
 
         /**
